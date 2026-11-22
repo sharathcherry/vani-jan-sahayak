@@ -14,7 +14,9 @@ services:
       - key: PORT
         value: 10000
       - key: QDRANT_COLLECTION
-        value: schemes_hybrid
+        value: schemes_small
+      - key: DENSE_MODEL
+        value: BAAI/bge-small-en-v1.5
       - key: AWS_REGION
         value: eu-north-1
       - key: BEDROCK_LLM_MODEL

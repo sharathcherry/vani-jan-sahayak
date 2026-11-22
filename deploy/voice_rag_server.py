@@ -51,8 +51,8 @@ app = FastAPI(title="GovSchemes Voice RAG", version="1.0.0")
 # ---------------------------------------------------------------------------
 
 QDRANT_LOCAL_PATH = os.getenv("QDRANT_PATH", "qdrant_hybrid_db")
-COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "schemes_hybrid")
-DENSE_MODEL = os.getenv("DENSE_MODEL", "BAAI/bge-large-en-v1.5")
+COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "schemes_small")
+DENSE_MODEL = os.getenv("DENSE_MODEL", "BAAI/bge-small-en-v1.5")
 SPARSE_MODEL = os.getenv("SPARSE_MODEL", "Qdrant/bm25")
 CANDIDATE_K = int(os.getenv("CANDIDATE_K", "20"))
 TOP_K = int(os.getenv("TOP_K", "5"))
