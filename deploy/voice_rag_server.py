@@ -52,12 +52,12 @@ app = FastAPI(title="GovSchemes Voice RAG", version="1.0.0")
 
 QDRANT_LOCAL_PATH = os.getenv("QDRANT_PATH", "qdrant_hybrid_db")
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "schemes_hybrid")
-DENSE_MODEL = "BAAI/bge-large-en-v1.5"
-SPARSE_MODEL = "Qdrant/bm25"
-CANDIDATE_K = 20
-TOP_K = 5
+DENSE_MODEL = os.getenv("DENSE_MODEL", "BAAI/bge-large-en-v1.5")
+SPARSE_MODEL = os.getenv("SPARSE_MODEL", "Qdrant/bm25")
+CANDIDATE_K = int(os.getenv("CANDIDATE_K", "20"))
+TOP_K = int(os.getenv("TOP_K", "5"))
 
-AWS_REGION = os.getenv("AWS_REGION", "eu-central-1")
+AWS_REGION = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "eu-north-1"))
 BEDROCK_LLM_MODEL = os.getenv("BEDROCK_LLM_MODEL", "eu.amazon.nova-lite-v1:0")
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -65,7 +65,7 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
 # S3 bucket for Transcribe (needs a bucket in same region)
-TRANSCRIBE_S3_BUCKET = os.getenv("BEDROCK_S3_BUCKET", "government-scheme")
+TRANSCRIBE_S3_BUCKET = os.getenv("BEDROCK_S3_BUCKET", os.getenv("TRANSCRIBE_S3_BUCKET", "government-scheme"))
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded singletons
@@ -155,10 +155,13 @@ def get_twilio():
 @app.on_event("startup")
 async def warmup():
     log.info("Warming up models...")
-    get_dense_embedder()
-    get_sparse_embedder()
-    get_qdrant()
-    log.info("Models ready.")
+    try:
+        get_dense_embedder()
+        get_sparse_embedder()
+        get_qdrant()
+        log.info("Models and vector database ready.")
+    except Exception as e:
+        log.warning("Warmup initial connection notice (will load on first request): %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -440,9 +443,37 @@ async def whatsapp_incoming(
 # Debug / Health endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/")
+async def root():
+    cloud_url = os.getenv("QDRANT_CLOUD_URL")
+    return {
+        "service": "Vani Jan Sahayak - Voice RAG Helpline",
+        "status": "online",
+        "version": "1.0.0",
+        "vector_backend": "qdrant_cloud" if cloud_url else "qdrant_local",
+        "collection": COLLECTION_NAME,
+        "endpoints": {
+            "health": "/health",
+            "voice_incoming": "/voice/incoming",
+            "voice_recording_ready": "/voice/recording_ready",
+            "whatsapp_incoming": "/whatsapp/incoming",
+            "debug_query": "/debug/query",
+            "docs": "/docs"
+        }
+    }
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "collection": COLLECTION_NAME, "qdrant": QDRANT_LOCAL_PATH}
+    cloud_url = os.getenv("QDRANT_CLOUD_URL")
+    return {
+        "status": "ok",
+        "service": "vani-jan-sahayak",
+        "collection": COLLECTION_NAME,
+        "backend": "qdrant_cloud" if cloud_url else "qdrant_local",
+        "region": AWS_REGION,
+        "model": BEDROCK_LLM_MODEL
+    }
 
 
 @app.post("/debug/query")
@@ -461,3 +492,10 @@ async def debug_query(request: Request):
         "chunks_count": len(chunks),
         "top_chunk": chunks[0] if chunks else None,
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    log.info("Starting Vani Voice RAG server on port %d...", port)
+    uvicorn.run("voice_rag_server:app", host="0.0.0.0", port=port, reload=False)

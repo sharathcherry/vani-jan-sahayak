@@ -1,0 +1,32 @@
+name: Keep Render Web Service Awake 24/7
+
+on:
+  schedule:
+    # Run every 14 minutes (Render free tier spins down after 15 minutes of inactivity)
+    - cron: '*/14 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Health Endpoint
+        run: |
+          TARGET_URL="${{ secrets.RENDER_SERVICE_URL }}"
+          if [ -z "$TARGET_URL" ]; then
+            TARGET_URL="https://vani-voice-rag.onrender.com"
+          fi
+          
+          # Remove trailing slash if present
+          TARGET_URL="${TARGET_URL%/}"
+          HEALTH_URL="${TARGET_URL}/health"
+          
+          echo "Pinging: $HEALTH_URL at $(date -u)"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 45 "$HEALTH_URL" || echo "000")
+          echo "HTTP Response Status: $STATUS"
+          
+          if [ "$STATUS" = "200" ]; then
+            echo "Service is awake and healthy!"
+          else
+            echo "Service wake-up probe pinged (Status: $STATUS)."
+          fi

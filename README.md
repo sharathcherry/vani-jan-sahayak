@@ -188,12 +188,22 @@ ngrok http 8000
 # Set Twilio Voice webhook → https://<ngrok-url>/voice/incoming
 ```
 
-### 4️⃣ Deploy to AWS Lambda (container)
+### 4️⃣ Deploy 24/7 Cloud Service (Render.com - 100% Free)
 
-```bash
-# Build & push container image, update Lambda function
-.\deploy_lambda.ps1
-```
+This repository includes instant **Render Blueprint** configuration (`render.yaml`) and an automated **Keep-Alive GitHub Action** (`.github/workflows/keep_alive.yml`) so your service never sleeps:
+
+1. Create a free account at [Render.com](https://render.com).
+2. Click **New +** → **Blueprint** (or **Web Service**).
+3. Connect your GitHub repository: `sharathcherry/vani-jan-sahayak`.
+4. Enter your environment secrets:
+   - `QDRANT_CLOUD_URL` & `QDRANT_CLOUD_API_KEY`
+   - `TWILIO_ACCOUNT_SID` & `TWILIO_AUTH_TOKEN`
+   - `AWS_ACCESS_KEY_ID` & `AWS_SECRET_ACCESS_KEY`
+5. Click **Apply / Deploy**. Your public URL will be `https://vani-voice-rag.onrender.com`.
+6. Set your Twilio Voice Webhook to:
+   ```
+   https://<your-render-app>.onrender.com/voice/incoming
+   ```
 
 ---
 
