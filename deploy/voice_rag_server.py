@@ -1,16 +1,16 @@
 """
 voice_rag_server.py
 --------------------
-Twilio Voice → AWS Transcribe → Qdrant Hybrid RAG → Bedrock → Twilio TTS
+Twilio Voice / WhatsApp → Groq Whisper → Qdrant Hybrid RAG → Bedrock → Twilio TTS
 
 Flow:
-  1. User calls Twilio number
-  2. Twilio records voice message and hits /voice/incoming
-  3. Recording webhook hits /voice/transcribe with audio URL
-  4. AWS Transcribe converts audio → text
+  1. User calls Twilio number or sends WhatsApp voice note
+  2. Twilio records voice message and hits /voice/incoming or /whatsapp/incoming
+  3. Recording webhook hits /voice/recording_ready or /whatsapp/incoming with audio URL
+  4. Groq Whisper (whisper-large-v3-turbo) converts audio → text
   5. Qdrant hybrid retrieval finds relevant scheme chunks
   6. Bedrock Nova generates a concise answer
-  7. Server returns TwiML with <Say> (TTS) response to caller
+  7. Server returns TwiML with <Say> (TTS) or WhatsApp message response
 
 Run:
   uvicorn voice_rag_server:app --host 0.0.0.0 --port 8000
@@ -34,6 +34,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, Request, BackgroundTasks
 from fastapi.responses import PlainTextResponse, JSONResponse
+from groq import Groq
 from qdrant_client import QdrantClient
 from qdrant_client.models import FusionQuery, Fusion, Prefetch, SparseVector
 from fastembed import TextEmbedding, SparseTextEmbedding
@@ -78,6 +79,7 @@ _bedrock_client = None
 _transcribe_client = None
 _s3_client = None
 _twilio_client: TwilioClient | None = None
+_groq_client: Groq | None = None
 
 
 def get_qdrant():
@@ -146,6 +148,13 @@ def get_twilio():
     if _twilio_client is None:
         _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     return _twilio_client
+
+
+def get_groq():
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    return _groq_client
 
 
 # ---------------------------------------------------------------------------
@@ -254,66 +263,82 @@ Answer (keep it short and spoken-friendly):"""
 
 
 # ---------------------------------------------------------------------------
-# Core: Voice Transcription (AWS Transcribe)
+# Core: Voice Transcription (Groq Whisper)
 # ---------------------------------------------------------------------------
 
-def transcribe_audio_url(audio_url: str, call_sid: str) -> str:
+def transcribe_audio_url(audio_url: str, call_sid: str = "") -> str:
     """
-    Download audio from Twilio URL and transcribe with AWS Transcribe.
+    Download audio from Twilio URL and transcribe with Groq Whisper.
+    Uses whisper-large-v3-turbo with fallback to whisper-large-v3.
     Returns transcribed text.
     """
-    transcribe = get_transcribe()
-    s3 = get_s3()
+    log.info("Downloading audio from Twilio (SID=%s): %s", call_sid, audio_url)
+    try:
+        auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
+        resp = httpx.get(
+            audio_url,
+            auth=auth,
+            timeout=30.0,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        log.error("Failed to download audio from %s: %s", audio_url, e)
+        return ""
 
-    # 1. Download audio from Twilio (requires auth)
-    log.info("Downloading audio from Twilio: %s", audio_url)
-    resp = httpx.get(
-        audio_url,
-        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-        timeout=30.0,
-    )
-    resp.raise_for_status()
+    if not resp.content:
+        log.warning("Downloaded audio is empty from %s", audio_url)
+        return ""
 
-    # 2. Upload to S3 (Transcribe needs S3 URI)
-    s3_key = f"voice-transcribe/{call_sid}.wav"
-    s3.put_object(
-        Bucket=TRANSCRIBE_S3_BUCKET,
-        Key=s3_key,
-        Body=resp.content,
-        ContentType="audio/wav",
-    )
-    s3_uri = f"s3://{TRANSCRIBE_S3_BUCKET}/{s3_key}"
-    log.info("Uploaded audio to S3: %s", s3_uri)
+    # Detect content type / format (e.g. WhatsApp ogg vs Twilio Voice wav)
+    content_type = resp.headers.get("content-type", "").lower()
+    if "ogg" in content_type:
+        file_payload = ("audio.ogg", resp.content, "audio/ogg")
+    elif "mp3" in content_type or "mpeg" in content_type:
+        file_payload = ("audio.mp3", resp.content, "audio/mpeg")
+    else:
+        file_payload = ("audio.wav", resp.content, "audio/wav")
 
-    # 3. Start transcription job
-    job_name = f"voice-rag-{call_sid}-{int(time.time())}"
-    transcribe.start_transcription_job(
-        TranscriptionJobName=job_name,
-        Media={"MediaFileUri": s3_uri},
-        MediaFormat="wav",
-        LanguageCode="en-IN",  # Indian English; change to "hi-IN" for Hindi
-        Settings={"ShowSpeakerLabels": False},
-    )
+    groq = get_groq()
 
-    # 4. Poll until complete (max 60s for short voice messages)
-    for attempt in range(30):
-        status = transcribe.get_transcription_job(TranscriptionJobName=job_name)
-        job_status = status["TranscriptionJob"]["TranscriptionJobStatus"]
-        if job_status == "COMPLETED":
-            transcript_uri = status["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
-            # Download transcript JSON
-            transcript_resp = httpx.get(transcript_uri, timeout=10.0)
-            data = transcript_resp.json()
-            text = data["results"]["transcripts"][0]["transcript"]
-            log.info("Transcription: %s", text)
-            return text
-        elif job_status == "FAILED":
-            log.error("Transcription failed: %s", status)
-            return ""
-        time.sleep(2)
+    # 1. Primary: whisper-large-v3-turbo
+    try:
+        log.info(
+            "Transcribing audio (%d bytes) with Groq whisper-large-v3-turbo...",
+            len(resp.content),
+        )
+        transcription = groq.audio.transcriptions.create(
+            file=file_payload,
+            model="whisper-large-v3-turbo",
+            response_format="verbose_json",
+        )
+        text = transcription.text.strip()
+        log.info("Transcription result (whisper-large-v3-turbo): %s", text)
+        return text
+    except Exception as e:
+        log.warning(
+            "Groq whisper-large-v3-turbo failed (%s), falling back to whisper-large-v3...",
+            e,
+        )
 
-    log.error("Transcription timed out for job: %s", job_name)
-    return ""
+    # 2. Fallback: whisper-large-v3
+    try:
+        log.info("Transcribing audio with fallback model whisper-large-v3...")
+        transcription = groq.audio.transcriptions.create(
+            file=file_payload,
+            model="whisper-large-v3",
+            response_format="verbose_json",
+        )
+        text = transcription.text.strip()
+        log.info("Transcription result (whisper-large-v3 fallback): %s", text)
+        return text
+    except Exception as e:
+        log.error(
+            "Groq Whisper transcription failed completely for SID=%s: %s",
+            call_sid,
+            e,
+        )
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -421,18 +446,19 @@ async def whatsapp_incoming(
     """
     from twilio.twiml.messaging_response import MessagingResponse
 
-    log.info("WhatsApp from=%s type=%s", From, MediaContentType0)
+    log.info("WhatsApp from=%s type=%s MediaUrl0=%s", From, MediaContentType0, MediaUrl0)
 
     query_text = ""
 
-    # Voice note (audio/ogg, audio/mpeg, etc.)
-    if MediaUrl0 and "audio" in MediaContentType0:
-        log.info("Transcribing WhatsApp voice note: %s", MediaUrl0)
-        query_text = transcribe_audio_url(MediaUrl0, MessageSid)
-    elif Body.strip():
-        # Text message — treat directly as query
+    # Voice note / media attachment: if MediaUrl0 is provided, transcribe via Groq Whisper
+    if MediaUrl0 and MediaUrl0.strip():
+        log.info("Transcribing WhatsApp media note from %s (SID=%s): %s", From, MessageSid, MediaUrl0)
+        query_text = transcribe_audio_url(MediaUrl0.strip(), MessageSid)
+
+    # Fallback to text message Body if no media attachment or empty transcription
+    if not query_text and Body.strip():
         query_text = Body.strip()
-        log.info("Text query: %s", query_text)
+        log.info("WhatsApp text query: %s", query_text)
 
     response = MessagingResponse()
 
