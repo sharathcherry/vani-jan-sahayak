@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Form, Request, BackgroundTasks
 from fastapi.responses import PlainTextResponse, JSONResponse
 from qdrant_client import QdrantClient
-from qdrant_client.models import FusionQuery, Prefetch, SparseVector
+from qdrant_client.models import FusionQuery, Fusion, Prefetch, SparseVector
 from fastembed import TextEmbedding, SparseTextEmbedding
 from twilio.twiml.voice_response import VoiceResponse, Record, Gather
 from twilio.rest import Client as TwilioClient
@@ -192,7 +192,7 @@ def hybrid_retrieve(query: str) -> list[dict]:
             Prefetch(query=dense_vec, using="dense", limit=CANDIDATE_K),
             Prefetch(query=sparse_vec, using="sparse", limit=CANDIDATE_K),
         ],
-        query=FusionQuery(fusion=FusionQuery.Fusion.RRF),
+        query=FusionQuery(fusion=Fusion.RRF),
         limit=TOP_K,
         with_payload=True,
     )
