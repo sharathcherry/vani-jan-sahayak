@@ -296,8 +296,10 @@ def synthesize_speech(text: str, lang: str = "en") -> str:
     # 3. Default built-in gTTS (zero-cost, reliable, supports all Indian languages)
     try:
         from gtts import gTTS
+        # Clean markdown asterisks and hash symbols before TTS
+        clean_text = text.replace("*", "").replace("#", "").replace("_", "").strip()
         tld = "co.in" if lang == "en" else "com"
-        tts = gTTS(text=text, lang=lang, tld=tld, slow=False)
+        tts = gTTS(text=clean_text[:350], lang=lang, tld=tld, slow=False)
         tts.save(str(filepath))
         log.info("Synthesized voice note via gTTS (%d bytes, lang=%s): %s", filepath.stat().st_size, lang, filename)
         return filename
@@ -425,11 +427,12 @@ def transcribe_audio_url(audio_url: str, call_sid: str = "") -> str:
 
     groq = get_groq()
 
-    # Indic scheme vocabulary biasing prompt for Whisper
+    # Multilingual balanced scheme prompt in Latin transliteration to prevent single-language script biasing
     scheme_prompt = (
-        "భారత ప్రభుత్వ పథకాలు, రైతు, వ్యవసాయం, ప్రధాన మంత్రి ఆవాస్ యోజన, పిఎం కిసాన్, "
-        "రైతు బంధు, కులం, స్వయం ఉపాధి, విద్యార్థి వేతనాలు, భారతీయ యోజనాయేం, PM Kisan, "
-        "Ayushman Bharat, ration card, subsidy, pension, scholarship, government schemes"
+        "Government schemes, PM Kisan Samman Nidhi, Rythu Bandhu, Rythu Bharosa, "
+        "Pradhan Mantri Awas Yojana, Kisan Credit Card KCC, scholarships, ration card, "
+        "subsidy, pension, farmer, agricultural loan, student, weaver, handloom artisan, "
+        "caste certificate, backward classes, EWS, Dalit Bandhu, Mudra loan, Jan Sahayak"
     )
 
     # 1. Primary: whisper-large-v3-turbo
@@ -728,7 +731,23 @@ async def debug_query(request: Request):
     }
 
 
-@app.post("/debug/transcribe")
+@app.post("/debug/tts")
+async def debug_tts(request: Request):
+    """Debug TTS speech synthesis."""
+    body = await request.json()
+    text = body.get("text", "నమస్కారం, ఇది పరీక్షా సందేశం.")
+    lang = body.get("lang", detect_indic_lang(text))
+    info = {"text": text, "lang": lang}
+    try:
+        filename = synthesize_speech(text, lang)
+        info["filename"] = filename
+        if filename:
+            filepath = AUDIO_CACHE_DIR / filename
+            info["file_exists"] = filepath.exists()
+            info["file_size"] = filepath.stat().st_size if filepath.exists() else 0
+    except Exception as e:
+        info["error"] = str(e)
+    return info
 async def debug_transcribe(request: Request):
     """Debug audio download and transcription."""
     body = await request.json()
