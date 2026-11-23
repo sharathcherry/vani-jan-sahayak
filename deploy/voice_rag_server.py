@@ -230,15 +230,27 @@ Question: {query}
 
 Answer (keep it short and spoken-friendly):"""
 
-    response = get_bedrock().converse(
-        modelId=BEDROCK_LLM_MODEL,
-        messages=[{"role": "user", "content": [{"text": prompt}]}],
-        inferenceConfig={"temperature": 0.0, "maxTokens": 256},
-    )
-
-    answer = response["output"]["message"]["content"][0]["text"]
-    log.info("Generated answer (%d chars)", len(answer))
-    return answer
+    try:
+        response = get_bedrock().converse(
+            modelId=BEDROCK_LLM_MODEL,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"temperature": 0.0, "maxTokens": 256},
+        )
+        answer = response["output"]["message"]["content"][0]["text"]
+        log.info("Generated answer via Bedrock (%d chars)", len(answer))
+        return answer
+    except Exception as e:
+        log.warning("Bedrock generation unavailable (%s). Falling back to retrieved scheme context.", e)
+        if chunks:
+            top_text = chunks[0].get("text", "")
+            clean_text = " ".join(top_text.split())
+            if len(clean_text) > 300:
+                clean_text = clean_text[:300] + "..."
+            return f"Regarding your query on government schemes: {clean_text}"
+        return (
+            "I'm sorry, I couldn't find any relevant government scheme for your query. "
+            "Please try rephrasing or call the helpline at 1800-11-1555."
+        )
 
 
 # ---------------------------------------------------------------------------
