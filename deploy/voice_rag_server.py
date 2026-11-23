@@ -249,7 +249,19 @@ Answer (keep it short and spoken-friendly):"""
         log.info("Generated answer via Bedrock (%d chars)", len(answer))
         return answer
     except Exception as e:
-        log.warning("Bedrock generation unavailable (%s). Falling back to retrieved scheme context.", e)
+        log.warning("Bedrock generation unavailable (%s). Trying Groq...", e)
+        try:
+            groq_resp = get_groq().chat.completions.create(
+                model=os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0.1,
+            )
+            answer = groq_resp.choices[0].message.content.strip()
+            log.info("Generated answer via Groq (%d chars)", len(answer))
+            return answer
+        except Exception as ge:
+            log.warning("Groq generation failed (%s). Falling back to retrieved scheme context.", ge)
         if chunks:
             top_text = chunks[0].get("text", "")
             clean_text = " ".join(top_text.split())
@@ -375,25 +387,52 @@ async def voice_incoming(request: Request):
 @app.post("/voice/recording_ready", response_class=PlainTextResponse)
 async def voice_recording_ready(
     request: Request,
-    background_tasks: BackgroundTasks,
-    RecordingUrl: str = Form(...),
-    CallSid: str = Form(...),
+    background_tasks: BackgroundTasks = None,
+    RecordingUrl: str = Form(""),
+    CallSid: str = Form(""),
+    From: str = Form(""),
+    To: str = Form(""),
     RecordingDuration: str = Form(""),
+    RecordingSid: str = Form(""),
+    Digits: str = Form(""),
 ):
     """
-    Step 2: Recording is ready.
-    Transcribe + retrieve + generate answer, then respond with TTS.
+    Step 2: Recording is ready callback from Twilio.
+    Form parameters: CallSid, From, To, RecordingUrl, RecordingDuration.
+    Transcribe (Groq Whisper) + retrieve (Qdrant) + generate answer (Groq/Bedrock), then respond with TTS TwiML.
+    Handles missing or unreachable recording URLs gracefully without crashing.
     """
-    log.info("Recording ready: CallSid=%s Duration=%ss", CallSid, RecordingDuration)
-    audio_url = f"{RecordingUrl}.wav"
+    log.info(
+        "Recording ready callback: CallSid=%s From=%s To=%s Duration=%ss Url=%s",
+        CallSid, From, To, RecordingDuration, RecordingUrl
+    )
 
-    # Transcribe audio → text
-    query_text = transcribe_audio_url(audio_url, CallSid)
-
-    if not query_text.strip():
+    # 1. Error handling: Missing RecordingUrl
+    if not RecordingUrl or not RecordingUrl.strip():
+        log.warning("Missing RecordingUrl in webhook callback for CallSid=%s", CallSid)
         response = VoiceResponse()
         response.say(
-            "Sorry, I couldn't understand your question. Please try calling again.",
+            "We did not receive any audio recording. Please call back and try again.",
+            voice="Polly.Aditi",
+            language="en-IN",
+        )
+        return PlainTextResponse(str(response), media_type="application/xml")
+
+    # 2. Format proper audio URL
+    if not RecordingUrl.endswith((".wav", ".mp3", ".ogg")):
+        audio_url = f"{RecordingUrl}.wav"
+    else:
+        audio_url = RecordingUrl
+
+    # 3. Transcribe audio → text
+    call_id = CallSid.strip() if CallSid else f"call-{int(time.time())}"
+    query_text = transcribe_audio_url(audio_url, call_id)
+
+    if not query_text.strip():
+        log.warning("Audio transcription returned empty text or failed for audio_url=%s", audio_url)
+        response = VoiceResponse()
+        response.say(
+            "Sorry, I couldn't understand your question or could not retrieve the audio recording. Please try calling again.",
             voice="Polly.Aditi",
             language="en-IN",
         )
@@ -401,10 +440,14 @@ async def voice_recording_ready(
 
     log.info("Query: %s", query_text)
 
-    # Retrieve from Qdrant
-    chunks = hybrid_retrieve(query_text)
+    # 4. Retrieve from Qdrant
+    try:
+        chunks = hybrid_retrieve(query_text)
+    except Exception as e:
+        log.error("Qdrant retrieval error: %s", e)
+        chunks = []
 
-    # Generate answer
+    # 5. Generate answer
     if chunks:
         answer = generate_answer(query_text, chunks)
     else:
@@ -413,7 +456,7 @@ async def voice_recording_ready(
             "Please try rephrasing or call the helpline at 1800-11-1555."
         )
 
-    # Respond with TTS
+    # 6. Respond with TTS TwiML
     response = VoiceResponse()
     response.say(answer, voice="Polly.Aditi", language="en-IN")
     response.say(
@@ -422,7 +465,7 @@ async def voice_recording_ready(
         language="en-IN",
     )
 
-    log.info("Responded to CallSid=%s", CallSid)
+    log.info("Responded to CallSid=%s with TwiML", CallSid)
     return PlainTextResponse(str(response), media_type="application/xml")
 
 
