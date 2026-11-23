@@ -734,19 +734,24 @@ async def debug_query(request: Request):
 @app.post("/debug/tts")
 async def debug_tts(request: Request):
     """Debug TTS speech synthesis."""
+    import traceback
     body = await request.json()
     text = body.get("text", "నమస్కారం, ఇది పరీక్షా సందేశం.")
     lang = body.get("lang", detect_indic_lang(text))
     info = {"text": text, "lang": lang}
     try:
-        filename = synthesize_speech(text, lang)
-        info["filename"] = filename
-        if filename:
-            filepath = AUDIO_CACHE_DIR / filename
-            info["file_exists"] = filepath.exists()
-            info["file_size"] = filepath.stat().st_size if filepath.exists() else 0
+        from gtts import gTTS
+        clean_text = text.replace("*", "").replace("#", "").replace("_", "").strip()
+        tld = "co.in" if lang == "en" else "com"
+        tts = gTTS(text=clean_text[:350], lang=lang, tld=tld, slow=False)
+        filepath = AUDIO_CACHE_DIR / "debug_test.mp3"
+        tts.save(str(filepath))
+        info["saved"] = True
+        info["bytes"] = filepath.stat().st_size
     except Exception as e:
+        info["saved"] = False
         info["error"] = str(e)
+        info["traceback"] = traceback.format_exc()
     return info
 async def debug_transcribe(request: Request):
     """Debug audio download and transcription."""
