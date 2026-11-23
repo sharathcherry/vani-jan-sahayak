@@ -32,8 +32,8 @@ from pathlib import Path
 import boto3
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, Request, BackgroundTasks
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi import FastAPI, Form, Request, BackgroundTasks, HTTPException
+from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse
 from groq import Groq
 from qdrant_client import QdrantClient
 from qdrant_client.models import FusionQuery, Fusion, Prefetch, SparseVector
@@ -46,6 +46,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="GovSchemes Voice RAG", version="1.0.0")
+
+# Audio cache directory for outbound voice notes
+AUDIO_CACHE_DIR = Path(os.getenv("AUDIO_CACHE_DIR", "/tmp/vani_audio_cache"))
+AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -219,26 +223,142 @@ def hybrid_retrieve(query: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Core: Answer Generation (Bedrock)
+# Language Detection & TTS (Text-to-Speech)
+# ---------------------------------------------------------------------------
+
+def detect_indic_lang(text: str) -> str:
+    """Detect Indian language from unicode script range."""
+    for char in text:
+        cp = ord(char)
+        if 0x0C00 <= cp <= 0x0C7F: return "te"  # Telugu
+        if 0x0900 <= cp <= 0x097F: return "hi"  # Hindi / Devanagari
+        if 0x0B80 <= cp <= 0x0BFF: return "ta"  # Tamil
+        if 0x0C80 <= cp <= 0x0CFF: return "kn"  # Kannada
+        if 0x0980 <= cp <= 0x09FF: return "bn"  # Bengali
+        if 0x0A80 <= cp <= 0x0AFF: return "gu"  # Gujarati
+        if 0x0D00 <= cp <= 0x0D7F: return "ml"  # Malayalam
+    return "en"
+
+
+def synthesize_speech(text: str, lang: str = "en") -> str:
+    """
+    Synthesize speech audio for the response text.
+    Supports Sarvam AI (preferred for Indic), ElevenLabs, and gTTS (default).
+    Returns the saved audio filename (e.g. 'vani_12345.mp3') or empty string.
+    """
+    if not text or not text.strip():
+        return ""
+
+    audio_id = f"vani_{uuid.uuid4().hex[:12]}"
+    filename = f"{audio_id}.mp3"
+    filepath = AUDIO_CACHE_DIR / filename
+
+    # 1. Sarvam AI (India's premier Indic neural voice platform)
+    sarvam_key = os.getenv("SARVAM_API_KEY")
+    if sarvam_key and lang in ["te", "hi", "ta", "kn", "bn", "mr", "gu", "pa", "ml"]:
+        try:
+            sarvam_lang_code = f"{lang}-IN"
+            headers = {"api-subscription-key": sarvam_key, "Content-Type": "application/json"}
+            payload = {
+                "inputs": [text[:500]],
+                "target_language_code": sarvam_lang_code,
+                "speaker": "meera",
+                "model": "bulbul:v1"
+            }
+            r = httpx.post("https://api.sarvam.ai/text-to-speech", json=payload, headers=headers, timeout=12.0)
+            if r.status_code == 200:
+                import base64
+                audio_bytes = base64.b64decode(r.json()["audios"][0])
+                filepath.write_bytes(audio_bytes)
+                log.info("Synthesized voice note via Sarvam AI (%d bytes): %s", len(audio_bytes), filename)
+                return filename
+        except Exception as se:
+            log.warning("Sarvam TTS failed (%s), falling back to gTTS", se)
+
+    # 2. ElevenLabs Multilingual v2
+    eleven_key = os.getenv("ELEVENLABS_API_KEY")
+    if eleven_key:
+        try:
+            voice_id = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+            headers = {"xi-api-key": eleven_key, "Content-Type": "application/json"}
+            payload = {
+                "text": text[:500],
+                "model_id": "eleven_multilingual_v2",
+            }
+            r = httpx.post(f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}", json=payload, headers=headers, timeout=15.0)
+            if r.status_code == 200:
+                filepath.write_bytes(r.content)
+                log.info("Synthesized voice note via ElevenLabs (%d bytes): %s", len(r.content), filename)
+                return filename
+        except Exception as ee:
+            log.warning("ElevenLabs TTS failed (%s), falling back to gTTS", ee)
+
+    # 3. Default built-in gTTS (zero-cost, reliable, supports all Indian languages)
+    try:
+        from gtts import gTTS
+        tld = "co.in" if lang == "en" else "com"
+        tts = gTTS(text=text, lang=lang, tld=tld, slow=False)
+        tts.save(str(filepath))
+        log.info("Synthesized voice note via gTTS (%d bytes, lang=%s): %s", filepath.stat().st_size, lang, filename)
+        return filename
+    except Exception as ge:
+        log.error("gTTS speech synthesis failed: %s", ge)
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Core: Answer Generation (Groq / Bedrock)
 # ---------------------------------------------------------------------------
 
 def generate_answer(query: str, chunks: list[dict]) -> str:
-    """Generate a concise spoken answer using Bedrock Nova."""
-    context = "\n\n".join(
-        [f"Scheme: {c['scheme_id']}\n{c['text']}" for c in chunks]
-    )
+    """Generate a concise spoken answer in the citizen's native language."""
+    context = "\n\n".join([f"Scheme: {c['scheme_id']}\n{c['text']}" for c in chunks])
+    lang = detect_indic_lang(query)
+    lang_names = {
+        "te": "Telugu (తెలుగు)",
+        "hi": "Hindi (हिंदी)",
+        "ta": "Tamil (தமிழ்)",
+        "kn": "Kannada (ಕನ್ನಡ)",
+        "bn": "Bengali (বাংলা)",
+        "mr": "Marathi (मराठी)",
+        "gu": "Gujarati (ગુજરાતી)",
+        "ml": "Malayalam (മലയാളം)",
+        "en": "Indian English",
+    }
+    target_lang = lang_names.get(lang, "Indian English")
 
-    prompt = f"""You are a helpful assistant for Indian government schemes. 
-A citizen has asked a question via voice call. Answer in simple, clear language 
-suitable for text-to-speech. Keep it under 100 words. If you don't know, say so.
+    prompt = f"""You are Vani (Jan Sahayak), an empathetic voice assistant for Indian Government schemes (MyScheme / Jan Sahayak).
+A citizen reached out with the following voice note: "{query}"
 
-Context:
+Retrieved Government Schemes Knowledge:
 {context}
 
-Question: {query}
+CRITICAL RULES:
+1. RESPOND ENTIRELY IN {target_lang}. Use the native script for that language.
+2. Address the citizen respectfully by name if provided in their message.
+3. Recommend 1 to 3 relevant schemes from the context matching their specific profile (caste, location, occupation, land, education).
+4. State the core benefit and key eligibility clearly.
+5. Keep the explanation conversational, spoken-friendly, clear, and under 80 words so it speaks naturally in a voice note.
+6. Do NOT invent schemes not in the context.
 
-Answer (keep it short and spoken-friendly):"""
+Spoken Response ({target_lang}):"""
 
+    # 1. Primary: Groq LLM (instant ~200-300ms latency)
+    if os.getenv("GROQ_API_KEY"):
+        try:
+            groq_resp = get_groq().chat.completions.create(
+                model=os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=220,
+                temperature=0.1,
+            )
+            answer = groq_resp.choices[0].message.content.strip()
+            log.info("Generated answer via Groq (%d chars)", len(answer))
+            return answer
+        except Exception as ge:
+            log.warning("Groq generation failed (%s). Falling back to Bedrock...", ge)
+
+    # 2. Secondary: Bedrock
     try:
         response = get_bedrock().converse(
             modelId=BEDROCK_LLM_MODEL,
@@ -249,29 +369,16 @@ Answer (keep it short and spoken-friendly):"""
         log.info("Generated answer via Bedrock (%d chars)", len(answer))
         return answer
     except Exception as e:
-        log.warning("Bedrock generation unavailable (%s). Trying Groq...", e)
-        try:
-            groq_resp = get_groq().chat.completions.create(
-                model=os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
-                temperature=0.1,
-            )
-            answer = groq_resp.choices[0].message.content.strip()
-            log.info("Generated answer via Groq (%d chars)", len(answer))
-            return answer
-        except Exception as ge:
-            log.warning("Groq generation failed (%s). Falling back to retrieved scheme context.", ge)
-        if chunks:
-            top_text = chunks[0].get("text", "")
-            clean_text = " ".join(top_text.split())
-            if len(clean_text) > 300:
-                clean_text = clean_text[:300] + "..."
-            return f"Regarding your query on government schemes: {clean_text}"
-        return (
-            "I'm sorry, I couldn't find any relevant government scheme for your query. "
-            "Please try rephrasing or call the helpline at 1800-11-1555."
-        )
+        log.warning("Bedrock generation unavailable (%s). Falling back to scheme summary.", e)
+
+    # 3. Fallback: Extracted scheme text
+    if chunks:
+        top_text = chunks[0].get("text", "")
+        clean_text = " ".join(top_text.split())
+        if len(clean_text) > 300:
+            clean_text = clean_text[:300] + "..."
+        return f"Regarding government schemes: {clean_text}"
+    return "I'm sorry, I couldn't find any relevant government scheme for your query. Please call 1800-11-1555."
 
 
 # ---------------------------------------------------------------------------
@@ -280,17 +387,22 @@ Answer (keep it short and spoken-friendly):"""
 
 def transcribe_audio_url(audio_url: str, call_sid: str = "") -> str:
     """
-    Download audio from Twilio URL and transcribe with Groq Whisper.
+    Download audio and transcribe with Groq Whisper.
     Uses whisper-large-v3-turbo with fallback to whisper-large-v3.
-    Returns transcribed text.
+    Includes Indic scheme prompt biasing for maximum phonetic accuracy.
     """
-    log.info("Downloading audio from Twilio (SID=%s): %s", call_sid, audio_url)
+    log.info("Downloading audio (SID=%s): %s", call_sid, audio_url)
     try:
-        auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
+        # Only attach Twilio auth if downloading directly from twilio.com
+        auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if ("twilio.com" in audio_url and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
         resp = httpx.get(
             audio_url,
             auth=auth,
-            timeout=30.0,
+            headers=headers,
+            timeout=25.0,
             follow_redirects=True,
         )
         resp.raise_for_status()
@@ -313,6 +425,13 @@ def transcribe_audio_url(audio_url: str, call_sid: str = "") -> str:
 
     groq = get_groq()
 
+    # Indic scheme vocabulary biasing prompt for Whisper
+    scheme_prompt = (
+        "భారత ప్రభుత్వ పథకాలు, రైతు, వ్యవసాయం, ప్రధాన మంత్రి ఆవాస్ యోజన, పిఎం కిసాన్, "
+        "రైతు బంధు, కులం, స్వయం ఉపాధి, విద్యార్థి వేతనాలు, భారతీయ యోజనాయేం, PM Kisan, "
+        "Ayushman Bharat, ration card, subsidy, pension, scholarship, government schemes"
+    )
+
     # 1. Primary: whisper-large-v3-turbo
     try:
         log.info(
@@ -322,6 +441,7 @@ def transcribe_audio_url(audio_url: str, call_sid: str = "") -> str:
         transcription = groq.audio.transcriptions.create(
             file=file_payload,
             model="whisper-large-v3-turbo",
+            prompt=scheme_prompt,
             response_format="verbose_json",
         )
         text = transcription.text.strip()
@@ -339,6 +459,7 @@ def transcribe_audio_url(audio_url: str, call_sid: str = "") -> str:
         transcription = groq.audio.transcriptions.create(
             file=file_payload,
             model="whisper-large-v3",
+            prompt=scheme_prompt,
             response_format="verbose_json",
         )
         text = transcription.text.strip()
@@ -456,14 +577,19 @@ async def voice_recording_ready(
             "Please try rephrasing or call the helpline at 1800-11-1555."
         )
 
-    # 6. Respond with TTS TwiML
+    # 6. Synthesize native audio for voice playback
+    server_base = os.getenv("SERVER_BASE_URL", "https://vani-voice-rag.onrender.com").rstrip("/")
+    lang = detect_indic_lang(answer if answer else query_text)
+    audio_file = synthesize_speech(answer, lang)
+
+    # 7. Respond with Voice TwiML
     response = VoiceResponse()
-    response.say(answer, voice="Polly.Aditi", language="en-IN")
-    response.say(
-        "Thank you for using the Government Schemes helpline. Goodbye!",
-        voice="Polly.Aditi",
-        language="en-IN",
-    )
+    if audio_file:
+        audio_url = f"{server_base}/audio/{audio_file}"
+        response.play(audio_url)
+        log.info("Playing synthesized voice note: %s", audio_url)
+    else:
+        response.say(answer, voice="Polly.Aditi", language="en-IN")
 
     log.info("Responded to CallSid=%s with TwiML", CallSid)
     return PlainTextResponse(str(response), media_type="application/xml")
@@ -486,6 +612,7 @@ async def whatsapp_incoming(
     """
     Handles WhatsApp messages (text or voice notes).
     Twilio webhook for WhatsApp incoming messages.
+    Returns both a structured WhatsApp text answer and a voice note media attachment.
     """
     from twilio.twiml.messaging_response import MessagingResponse
 
@@ -514,10 +641,36 @@ async def whatsapp_incoming(
     if chunks:
         answer = generate_answer(query_text, chunks)
     else:
-        answer = "Sorry, no relevant scheme found. Try rephrasing your question."
+        answer = "Sorry, no relevant scheme found matching your profile. Please visit the nearest CSC/MeeSeva center or call 1800-11-1555."
 
-    response.message(f"🏛️ *GovSchemes Answer:*\n\n{answer}")
+    # Synthesize native language voice note audio
+    server_base = os.getenv("SERVER_BASE_URL", "https://vani-voice-rag.onrender.com").rstrip("/")
+    lang = detect_indic_lang(answer if answer else query_text)
+    audio_file = synthesize_speech(answer, lang)
+
+    # Attach both formatted text and audio media voice note to TwiML
+    msg = response.message()
+    msg.body(f"🏛️ *GovSchemes Answer:*\n\n{answer}")
+    if audio_file:
+        audio_url = f"{server_base}/audio/{audio_file}"
+        msg.media(audio_url)
+        log.info("Attached voice note audio to WhatsApp reply: %s", audio_url)
+
     return PlainTextResponse(str(response), media_type="application/xml")
+
+
+# ---------------------------------------------------------------------------
+# Audio Stream / Serving Endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/audio/{filename}")
+async def get_audio_file(filename: str):
+    """Serve cached TTS audio voice notes."""
+    safe_name = os.path.basename(filename)
+    filepath = AUDIO_CACHE_DIR / safe_name
+    if filepath.exists():
+        return FileResponse(filepath, media_type="audio/mpeg")
+    return PlainTextResponse("Audio not found", status_code=404)
 
 
 # ---------------------------------------------------------------------------
