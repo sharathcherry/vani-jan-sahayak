@@ -728,6 +728,31 @@ async def debug_query(request: Request):
     }
 
 
+@app.post("/debug/transcribe")
+async def debug_transcribe(request: Request):
+    """Debug audio download and transcription."""
+    body = await request.json()
+    url = body.get("audio_url", "")
+    info = {"url": url}
+    try:
+        auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if ("twilio.com" in url and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        resp = httpx.get(url, auth=auth, headers=headers, timeout=20.0, follow_redirects=True)
+        info["download_status"] = resp.status_code
+        info["download_bytes"] = len(resp.content)
+        info["content_type"] = resp.headers.get("content-type")
+    except Exception as e:
+        info["download_error"] = str(e)
+        return info
+
+    try:
+        text = transcribe_audio_url(url, "debug_test")
+        info["transcription"] = text
+    except Exception as e:
+        info["transcribe_error"] = str(e)
+    return info
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
