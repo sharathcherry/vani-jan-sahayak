@@ -44,6 +44,7 @@ docker_build.log
 *.mp3
 *.mpeg
 *.wav
+!deploy/test_audio/*.mp3
 
 # PDF / images
 pdf_pages/
