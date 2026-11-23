@@ -217,8 +217,8 @@ _BENEFICIARY_PATTERNS: list[tuple[str, list[str]]] = [
     ("is_for_sc_st",    [r"\bsc\b", r"\bst\b", "scheduled caste", "scheduled tribe",
                          "dalit", "tribal", "adivasi"]),
     ("is_for_students", ["student", "scholarship", "school", "college",
-                         "universit", "educat", "b\.?tech", "btech", "mbbs",
-                         "b\.sc", "m\.tech", "phd"]),
+                         "universit", "educat", r"b\.?tech", "btech", "mbbs",
+                         r"b\.sc", r"m\.tech", "phd"]),
 ]
 
 

@@ -27,9 +27,15 @@ QDRANT_URL = os.getenv("QDRANT_URL", "")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 QDRANT_COLLECTION = "gov_schemes"
 
-# ── BM25 ──────────────────────────────────────────────────────────────────────
+# ── BM25 & Corpus (Safe Serialization) ────────────────────────────────────────
 BM25_INDEX_PATH = str(INDEX_DIR / "bm25_index.pkl")
-CORPUS_PATH = str(INDEX_DIR / "corpus.pkl")
+BM25_JSON_PATH = str(INDEX_DIR / "bm25_index.json")
+CORPUS_PATH = str(INDEX_DIR / "corpus.json")
+CORPUS_PKL_PATH = str(INDEX_DIR / "corpus.pkl")
+
+# ── Parent Docs ───────────────────────────────────────────────────────────────
+PARENT_DOCS_PATH = str(INDEX_DIR / "parent_docs.json")
+PARENT_DOCS_PKL_PATH = str(INDEX_DIR / "parent_docs.pkl")
 
 # ── Retrieval knobs ───────────────────────────────────────────────────────────
 BM25_TOP_K = int(os.getenv("BM25_TOP_K", "50"))

@@ -34,7 +34,7 @@ from qdrant_client.models import (
     ScoredPoint,
 )
 
-from rag.config import (
+from rag_pipeline.config import (
     BM25_INDEX_PATH,
     BM25_TOP_K,
     CHUNK_TYPE_BOOST,
@@ -317,6 +317,38 @@ def _deduplicate(chunks: list[RetrievedChunk], max_per_scheme: int) -> list[Retr
 # Loaders
 # ─────────────────────────────────────────────────────────────────────────────
 
+import builtins
+import io
+import json
+
+class SafeUnpickler(pickle.Unpickler):
+    """Restricts unpickling to safe scalar/container types to prevent arbitrary code execution."""
+    SAFE_BUILTINS = {
+        'dict', 'list', 'set', 'frozenset', 'tuple', 'int', 'float', 'str', 'bool', 'bytes', 'bytearray', 'NoneType'
+    }
+    def find_class(self, module, name):
+        if module == "builtins" and name in self.SAFE_BUILTINS:
+            return getattr(builtins, name)
+        if module.startswith("numpy") or module.startswith("rank_bm25"):
+            import importlib
+            mod = importlib.import_module(module)
+            return getattr(mod, name)
+        raise pickle.UnpicklingError(f"Security blocked: disallowed deserialization of {module}.{name}")
+
+def _safe_load_data(path: Path):
+    json_path = path.with_suffix(".json")
+    if json_path.exists():
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if path.exists():
+        with open(path, "rb") as f:
+            try:
+                return SafeUnpickler(f).load()
+            except Exception:
+                # If file is empty or corrupted stub, return empty safe structure
+                return {}
+    return {}
+
 def _make_qdrant_client() -> QdrantClient:
     if QDRANT_URL:
         return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
@@ -331,17 +363,11 @@ def _load_bm25_and_corpus():
             "BM25 index not found. Run `python ingest.py` to build the index first."
         )
     with open(bm25_p, "rb") as f:
-        bm25 = pickle.load(f)
-    with open(corpus_p, "rb") as f:
-        corpus = pickle.load(f)
+        bm25 = SafeUnpickler(f).load()
+    corpus = _safe_load_data(corpus_p)
     return bm25, corpus
 
 
 def _load_parent_docs() -> dict[str, dict]:
     p = Path(PARENT_DOCS_PATH)
-    if not p.exists():
-        raise FileNotFoundError(
-            "parent_docs.pkl not found. Run `python ingest.py` to build the index first."
-        )
-    with open(p, "rb") as f:
-        return pickle.load(f)
+    return _safe_load_data(p)

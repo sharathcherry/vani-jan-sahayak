@@ -39,3 +39,9 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
+      - key: META_VERIFY_TOKEN
+        value: vani_meta_verify_token_2026
+      - key: META_ACCESS_TOKEN
+        sync: false
+      - key: META_PHONE_NUMBER_ID
+        sync: false

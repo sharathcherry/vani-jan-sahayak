@@ -25,7 +25,6 @@ Force rebuild: python ingest.py --force
 from __future__ import annotations
 
 import json
-import pickle
 import uuid
 from pathlib import Path
 
@@ -38,22 +37,30 @@ from qdrant_client.models import (
     VectorParams,
 )
 
-from rag.config import (
+from rag_pipeline.config import (
     BM25_INDEX_PATH,
+    BM25_JSON_PATH,
     CORPUS_PATH,
+    CORPUS_PKL_PATH,
     DATA_DIR,
     EMBED_DIM,
     INDEX_DIR,
+    PARENT_DOCS_PATH,
+    PARENT_DOCS_PKL_PATH,
     QDRANT_API_KEY,
     QDRANT_COLLECTION,
     QDRANT_LOCAL_PATH,
     QDRANT_URL,
 )
-from rag.embedder import Embedder
+from rag_pipeline.embedder import Embedder
+from rag_pipeline.serialization import (
+    save_bm25_safe,
+    save_corpus_safe,
+    save_parent_docs_safe,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CHUNKS_DIR = BASE_DIR / "bedrock_chunks"
-PARENT_DOCS_PATH = str(INDEX_DIR / "parent_docs.pkl")
 
 CHUNK_SUBDIRS = ["summary", "eligibility", "benefits", "application", "qa", "new"]
 

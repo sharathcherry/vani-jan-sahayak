@@ -22,6 +22,7 @@ Expose via ngrok for local dev:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -31,8 +32,9 @@ from pathlib import Path
 
 import boto3
 import httpx
+import tempfile
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, Request, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Form, Request, BackgroundTasks, HTTPException, Response
 from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse
 from groq import Groq
 from qdrant_client import QdrantClient
@@ -68,6 +70,12 @@ BEDROCK_LLM_MODEL = os.getenv("BEDROCK_LLM_MODEL", "eu.amazon.nova-lite-v1:0")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+
+# Meta WhatsApp Business Cloud API
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "").strip()
+META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "").strip()
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "vani_meta_verify_token_2026").strip()
+META_API_VERSION = os.getenv("META_API_VERSION", "v21.0").strip()
 
 # S3 bucket for Transcribe (needs a bucket in same region)
 TRANSCRIBE_S3_BUCKET = os.getenv("BEDROCK_S3_BUCKET", os.getenv("TRANSCRIBE_S3_BUCKET", "government-scheme"))
@@ -161,20 +169,44 @@ def get_groq():
     return _groq_client
 
 
+def cleanup_old_audio_files(max_age_seconds: int = 7200) -> int:
+    """Prunes temporary synthesized audio files older than max_age_seconds (default 2 hours)."""
+    pruned = 0
+    try:
+        now = time.time()
+        for f in AUDIO_CACHE_DIR.glob("*.mp3"):
+            if f.is_file() and (now - f.stat().st_mtime > max_age_seconds):
+                f.unlink(missing_ok=True)
+                pruned += 1
+        if pruned > 0:
+            log.info("Pruned %d expired audio cache files (>%ds old).", pruned, max_age_seconds)
+    except Exception as e:
+        log.warning("Audio cache cleanup warning: %s", e)
+    return pruned
+
+
+async def _async_background_warmup():
+    """Warms up embedding models and vector database in background without blocking health checks."""
+    log.info("Starting background model warmup and initial maintenance...")
+    cleanup_old_audio_files(max_age_seconds=7200)
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, get_dense_embedder)
+        await loop.run_in_executor(None, get_sparse_embedder)
+        await loop.run_in_executor(None, get_qdrant)
+        log.info("Background model warmup complete. Models ready.")
+    except Exception as e:
+        log.warning("Background warmup notice (will load on first request): %s", e)
+
+
 # ---------------------------------------------------------------------------
-# Warm up models on startup (prevents first-call hang)
+# Warm up models on startup (Non-blocking: allows /health to respond immediately)
 # ---------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def warmup():
-    log.info("Warming up models...")
-    try:
-        get_dense_embedder()
-        get_sparse_embedder()
-        get_qdrant()
-        log.info("Models and vector database ready.")
-    except Exception as e:
-        log.warning("Warmup initial connection notice (will load on first request): %s", e)
+    log.info("FastAPI startup: server ready to accept health probes immediately.")
+    asyncio.create_task(_async_background_warmup())
 
 
 # ---------------------------------------------------------------------------
@@ -182,12 +214,54 @@ async def warmup():
 # ---------------------------------------------------------------------------
 
 def encode_dense(text: str) -> list[float]:
-    return list(get_dense_embedder().embed([text]))[0].tolist()
+    prefix = "Represent this sentence for searching relevant passages: "
+    query_text = text if text.startswith(prefix) else (prefix + text)
+    return list(get_dense_embedder().embed([query_text]))[0].tolist()
 
 
 def encode_sparse(text: str) -> SparseVector:
     sp = list(get_sparse_embedder().embed([text]))[0]
     return SparseVector(indices=sp.indices.tolist(), values=sp.values.tolist())
+
+
+# ---------------------------------------------------------------------------
+# Cross-Lingual Intent Normalization (Groq Fast LLM)
+# ---------------------------------------------------------------------------
+
+def normalize_and_translate_query(query: str) -> dict:
+    """
+    Extracts key user demographic intent (occupation, state, caste/category, income)
+    and translates non-English regional speech queries into concise English search keywords.
+    Powered by ultra-fast Groq qwen/qwen3.8-27b (~150ms).
+    """
+    if not query or not query.strip():
+        return {"english_query": "", "language": "en"}
+
+    client = get_groq()
+    sys_prompt = (
+        "You are an intent extractor for Indian Government welfare schemes. "
+        "Analyze the citizen's query. Extract their details and generate a concise English search phrase (3-8 words) "
+        "matching government welfare schemes. Output strictly valid JSON with keys: "
+        "'english_query', 'language', 'occupation', 'state', 'caste_or_category'."
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": query}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=150,
+        )
+        content = resp.choices[0].message.content
+        data = json.loads(content)
+        log.info("Normalized query: '%s' -> '%s' (lang=%s)", query[:40], data.get("english_query"), data.get("language"))
+        return data
+    except Exception as e:
+        log.warning("normalize_and_translate_query fallback: %s", e)
+        return {"english_query": query, "language": "en"}
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +386,7 @@ def synthesize_speech(text: str, lang: str = "en") -> str:
 # Core: Answer Generation (Groq / Bedrock)
 # ---------------------------------------------------------------------------
 
-def generate_answer(query: str, chunks: list[dict]) -> str:
+def generate_answer(query: str, chunks: list[dict], profile: dict | None = None) -> str:
     """Generate a concise spoken answer in the citizen's native language."""
     context = "\n\n".join([f"Scheme: {c['scheme_id']}\n{c['text']}" for c in chunks])
     lang = detect_indic_lang(query)
@@ -660,6 +734,250 @@ async def whatsapp_incoming(
         log.info("Attached voice note audio to WhatsApp reply: %s", audio_url)
 
     return PlainTextResponse(str(response), media_type="application/xml")
+
+
+# ---------------------------------------------------------------------------
+# Meta WhatsApp Business Cloud API Integration (Direct, Zero-Proxy, Ultra-Fast)
+# ---------------------------------------------------------------------------
+
+async def download_meta_media(media_id: str) -> tuple[bytes, str]:
+    """
+    Fetch media URL and download raw audio bytes directly from Meta Graph API.
+    Uses META_ACCESS_TOKEN for secure authenticated access to Meta lookaside CDN.
+    """
+    if not META_ACCESS_TOKEN:
+        raise ValueError("META_ACCESS_TOKEN is not configured")
+
+    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        # Step 1: Retrieve temporary media download URL from Graph API
+        meta_url = f"https://graph.facebook.com/{META_API_VERSION}/{media_id}"
+        resp = await client.get(meta_url, headers=headers)
+        resp.raise_for_status()
+        media_info = resp.json()
+
+        download_url = media_info.get("url")
+        mime_type = media_info.get("mime_type", "audio/ogg")
+        if not download_url:
+            raise ValueError(f"No media download URL returned by Meta for media_id={media_id}")
+
+        # Step 2: Download raw binary stream directly from Meta CDN
+        dl_resp = await client.get(download_url, headers=headers)
+        dl_resp.raise_for_status()
+        return dl_resp.content, mime_type
+
+
+def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+    """
+    Transcribe in-memory audio bytes directly using Groq Whisper.
+    Avoids long-term disk persistence and leverages whisper-large-v3 for Indic native script.
+    """
+    ext = ".ogg" if "ogg" in mime_type.lower() else ".mp3"
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = Path(tmp.name)
+
+    primary_model = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3")
+    fallback_model = "whisper-large-v3-turbo"
+
+    try:
+        with open(tmp_path, "rb") as af:
+            try:
+                transcription = get_groq().audio.transcriptions.create(
+                    model=primary_model,
+                    file=af,
+                    response_format="json",
+                    temperature=0.0,
+                )
+                return (transcription.text or "").strip()
+            except Exception as e_primary:
+                log.warning("Primary Whisper model %s failed (%s), attempting fallback %s", primary_model, e_primary, fallback_model)
+                af.seek(0)
+                transcription = get_groq().audio.transcriptions.create(
+                    model=fallback_model,
+                    file=af,
+                    response_format="json",
+                    temperature=0.0,
+                )
+                return (transcription.text or "").strip()
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+async def send_meta_whatsapp_message(
+    to: str,
+    text: str,
+    audio_filename: str = "",
+    phone_number_id: str = "",
+) -> None:
+    """
+    Send text response and voice note audio directly to citizen via Meta WhatsApp Cloud API.
+    No Twilio intermediary or transcoding delays.
+    """
+    pid = phone_number_id or META_PHONE_NUMBER_ID
+    if not pid or not META_ACCESS_TOKEN:
+        log.warning("Cannot send Meta message: META_PHONE_NUMBER_ID or META_ACCESS_TOKEN not configured")
+        return
+
+    url = f"https://graph.facebook.com/{META_API_VERSION}/{pid}/messages"
+    headers = {
+        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    server_base = os.getenv("SERVER_BASE_URL", "https://vani-voice-rag.onrender.com").rstrip("/")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # 1. Send formatted text response
+        text_payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "text",
+            "text": {
+                "preview_url": False,
+                "body": f"🏛️ *GovSchemes Answer:*\n\n{text}"
+            }
+        }
+        try:
+            r_text = await client.post(url, headers=headers, json=text_payload)
+            if r_text.status_code >= 400:
+                log.error("Meta WhatsApp text send failed (%s): %s", r_text.status_code, r_text.text)
+            else:
+                log.info("Sent Meta WhatsApp text to %s (status=%s)", to, r_text.status_code)
+        except Exception as e:
+            log.error("Exception sending Meta WhatsApp text to %s: %s", to, e)
+
+        # 2. Send synthesized voice note audio if available
+        if audio_filename:
+            audio_url = f"{server_base}/audio/{audio_filename}"
+            audio_payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": to,
+                "type": "audio",
+                "audio": {"link": audio_url}
+            }
+            try:
+                r_audio = await client.post(url, headers=headers, json=audio_payload)
+                if r_audio.status_code >= 400:
+                    log.error("Meta WhatsApp audio send failed (%s): %s", r_audio.status_code, r_audio.text)
+                else:
+                    log.info("Sent Meta WhatsApp voice note to %s: %s", to, audio_url)
+            except Exception as e:
+                log.error("Exception sending Meta WhatsApp audio to %s: %s", to, e)
+
+
+async def process_meta_incoming_message(
+    sender_wa_id: str,
+    message: dict,
+    phone_number_id: str = "",
+) -> None:
+    """
+    Asynchronous background handler for incoming Meta WhatsApp message.
+    Handles both voice notes ('audio') and text ('text') messages without blocking webhooks.
+    """
+    msg_type = message.get("type", "")
+    query = ""
+
+    if msg_type == "audio":
+        media_id = message.get("audio", {}).get("id", "")
+        mime_type = message.get("audio", {}).get("mime_type", "audio/ogg")
+        log.info("Processing Meta audio message from %s (media_id=%s)", sender_wa_id, media_id)
+        try:
+            audio_bytes, mime = await download_meta_media(media_id)
+            query = transcribe_audio_bytes(audio_bytes, mime)
+            log.info("Transcribed Meta audio query from %s: '%s'", sender_wa_id, query)
+        except Exception as e:
+            log.error("Failed to download or transcribe Meta audio from %s: %s", sender_wa_id, e)
+            await send_meta_whatsapp_message(
+                to=sender_wa_id,
+                text="Namaste. We were unable to process your voice note. Please try speaking again or send your question as text.",
+                phone_number_id=phone_number_id,
+            )
+            return
+    elif msg_type == "text":
+        query = message.get("text", {}).get("body", "").strip()
+        log.info("Processing Meta text message from %s: '%s'", sender_wa_id, query)
+    else:
+        log.info("Ignoring unsupported Meta message type: %s", msg_type)
+        return
+
+    if not query:
+        return
+
+    # Language detection & Cross-Lingual RAG
+    lang = detect_indic_lang(query)
+    profile = normalize_and_translate_query(query)
+    search_query = profile.get("english_query") or query
+
+    chunks = hybrid_retrieve(search_query)
+    if not chunks and search_query != query:
+        chunks = hybrid_retrieve(query)
+
+    answer = generate_answer(query, chunks, profile=profile) if chunks else (
+        "Namaste. I could not find relevant government schemes matching your profile. "
+        "Please visit your nearest Common Service Centre (CSC) or call the National Helpline at 1800-11-1555."
+    )
+
+    audio_file = synthesize_speech(answer, lang)
+
+    await send_meta_whatsapp_message(
+        to=sender_wa_id,
+        text=answer,
+        audio_filename=audio_file,
+        phone_number_id=phone_number_id,
+    )
+
+
+@app.get("/meta/webhook")
+async def meta_webhook_verify(request: Request):
+    """
+    Meta Webhook Verification endpoint (hub.mode, hub.challenge, hub.verify_token).
+    Required by Meta Developer Console when configuring webhook URLs.
+    """
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == META_VERIFY_TOKEN:
+        log.info("Meta webhook verified successfully (hub.challenge=%s)", challenge)
+        return Response(content=challenge, media_type="text/plain", status_code=200)
+
+    log.warning("Meta webhook verification rejected: token mismatch (received %r vs expected %r)", token, META_VERIFY_TOKEN)
+    raise HTTPException(status_code=403, detail="Verification token mismatch")
+
+
+@app.post("/meta/webhook")
+async def meta_webhook_incoming(request: Request, background_tasks: BackgroundTasks):
+    """
+    Meta WhatsApp Cloud API incoming webhook endpoint.
+    Returns HTTP 200 immediately to Meta, scheduling full STT + RAG + TTS pipeline in background.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    if body.get("object") != "whatsapp_business_account":
+        return JSONResponse({"status": "ignored", "reason": "not a whatsapp_business_account object"}, status_code=200)
+
+    for entry in body.get("entry", []):
+        for change in entry.get("changes", []):
+            val = change.get("value", {})
+            phone_number_id = val.get("metadata", {}).get("phone_number_id", "")
+            for message in val.get("messages", []):
+                sender = message.get("from", "")
+                if sender and ("audio" in message or "text" in message):
+                    log.info("Enqueuing background processing for Meta message from %s (id=%s)", sender, message.get("id"))
+                    background_tasks.add_task(
+                        process_meta_incoming_message,
+                        sender,
+                        message,
+                        phone_number_id,
+                    )
+
+    return JSONResponse({"status": "ok"}, status_code=200)
 
 
 # ---------------------------------------------------------------------------

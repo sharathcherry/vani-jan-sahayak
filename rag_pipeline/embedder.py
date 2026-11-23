@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from rag.config import (
+from rag_pipeline.config import (
     EMBED_MODEL,
     EMBED_BATCH_SIZE,
     EMBED_MAX_LENGTH,

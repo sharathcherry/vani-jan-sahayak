@@ -14,7 +14,7 @@ AWS SageMaker:
 """
 from __future__ import annotations
 
-from rag.config import (
+from rag_pipeline.config import (
     GROQ_API_KEY,
     GROQ_MODEL,
     LLM_PROVIDER,

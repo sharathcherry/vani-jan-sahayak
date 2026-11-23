@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from rag.config import (
+from rag_pipeline.config import (
     ENABLE_AUTO_FILTER,
     ENABLE_MULTI_QUERY,
     ENABLE_QUERY_EXPAND,
@@ -19,16 +19,16 @@ from rag.config import (
     NUM_MULTI_QUERIES,
     RERANK_TOP_K,
 )
-from rag.embedder import Embedder
-from rag.llm_client import LLMClient
-from rag.query_processor import (
+from rag_pipeline.embedder import Embedder
+from rag_pipeline.llm_client import LLMClient
+from rag_pipeline.query_processor import (
     build_query_prompt,
     expand_query,
     extract_metadata_filters,
     parse_query_variants,
 )
-from rag.reranker import Reranker
-from rag.retriever import RetrievedChunk, Retriever
+from rag_pipeline.reranker import Reranker
+from rag_pipeline.retriever import RetrievedChunk, Retriever
 
 
 @dataclass
